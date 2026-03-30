@@ -6,6 +6,7 @@ import psutil
 import shutil
 import time
 import logging
+import re
 from urllib.parse import urlparse, unquote
 from bs4 import BeautifulSoup
 
@@ -90,23 +91,31 @@ def upload_gofile(file):
         return None
 
 # ------------------------
-# Download using aria2c (with process tracking)
+# Download using wget (REPLACED aria2c)
 # ------------------------
 async def download_file(msg, url, filename):
     global current_process
+    
+    # wget command with resume support, progress, and speed limit
     cmd = [
-        "aria2c",
-        "-x", "16",
-        "-s", "16",
-        "--summary-interval=1",
-        "--file-allocation=none",
-        "--auto-file-renaming=false",
-        "--header=User-Agent: Mozilla/5.0",
-        "-o", filename,
+        "wget",
+        "--progress=bar:force:noscroll",  # Progress bar
+        "--tries=0",                      # Infinite retries
+        "--timeout=30",                   # Timeout
+        "--limit-rate=10m",               # Speed limit 10MB/s
+        "-c",                             # Continue partial download
+        "--user-agent=Mozilla/5.0",       # User agent
+        "-O", filename,                   # Output filename
         url
     ]
+    
     process = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+        cmd, 
+        stdout=subprocess.PIPE, 
+        stderr=subprocess.STDOUT, 
+        text=True,
+        bufsize=1,  # Line buffered
+        universal_newlines=True
     )
     current_process = process
 
@@ -116,28 +125,54 @@ async def download_file(msg, url, filename):
     ]])
 
     last_update = time.time()
+    last_progress = ""
+    
     while True:
         line = process.stdout.readline()
-        if not line:
+        if not line and process.poll() is not None:
             break
-        if "%" in line and time.time() - last_update > 2:
-            last_update = time.time()
-            try:
-                await msg.edit_text(
-                    f"📥 Downloading\n`{filename}`\n\n{line.strip()}",
-                    parse_mode="Markdown",
-                    reply_markup=cancel_keyboard
-                )
-            except:
-                pass
+            
+        # Parse wget progress
+        if '%' in line and 'MB' in line:
+            # Extract percentage and speed
+            percent_match = re.search(r'(\d+(?:\.\d+)?)%', line)
+            speed_match = re.search(r'([0-9.]+[KMG]?B/s)', line)
+            
+            if percent_match:
+                progress = f"[{percent_match.group(1)}%] "
+                if speed_match:
+                    progress += speed_match.group(1)
+                if progress != last_progress and time.time() - last_update > 1.5:
+                    last_progress = progress
+                    last_update = time.time()
+                    try:
+                        await msg.edit_text(
+                            f"📥 Downloading\n`{filename}`\n\n"
+                            f"{progress}\n"
+                            f"`{line.strip()}`",
+                            parse_mode="Markdown",
+                            reply_markup=cancel_keyboard
+                        )
+                    except:
+                        pass
 
+    # Wait for process to complete
     code = process.wait()
-    if code != 0 or not os.path.exists(filename):
-        raise Exception("Download failed")
     current_process = None
+    
+    if code != 0 or not os.path.exists(filename) or os.path.getsize(filename) == 0:
+        raise Exception("Download failed or file is empty")
+    
+    file_size = os.path.getsize(filename) / (1024**3)  # GB
+    await msg.edit_text(
+        f"✅ Download Complete\n"
+        f"`{filename}`\n"
+        f"📦 Size: {file_size:.2f} GB",
+        parse_mode="Markdown"
+    )
 
 # ------------------------
-# Worker
+# Worker (minor changes for wget)
 # ------------------------
 async def worker(app):
     global current_task, current_file, current_process, current_chat, cancel_requested
@@ -190,7 +225,7 @@ async def worker(app):
                 await msg.edit_text("❌ Upload failed")
 
         except Exception as e:
-            await msg.edit_text(f"❌ Error\n{e}")
+            await msg.edit_text(f"❌ Error\n`{str(e)}`", parse_mode="Markdown")
 
         finally:
             if os.path.exists(filename):
@@ -202,12 +237,12 @@ async def worker(app):
             cancel_requested = False
 
 # ------------------------
-# Commands
+# Commands (unchanged)
 # ------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sys = get_system_info()
     await update.message.reply_text(
-        f"🤖 Mahiro Mirror Bot Ready\n\n"
+        f"🤖 Mahiro Mirror Bot Ready (wget version)\n\n"
         f"CPU : {sys['cpu']}\n"
         f"RAM : {sys['ram']}\n"
         f"Disk : {sys['disk']}\n\n"
@@ -281,13 +316,13 @@ async def mirror(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("❌ Cancel", callback_data=f"cancel|{cache_id}")
         ]]
         await update.message.reply_text(
-            "👋 *Hi! I’m Mahiro BOT*\nI detected a file link, choose an option below.",
+            "👋 *Hi! I'm Mahiro BOT*\nI detected a file link, choose an option below.",
             reply_markup=InlineKeyboardMarkup(buttons),
             parse_mode="Markdown"
         )
 
 # ------------------------
-# Callback query handler
+# Callback query handler (unchanged)
 # ------------------------
 async def mirror_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global current_process, current_task, current_file, current_chat, cancel_requested
@@ -354,12 +389,12 @@ async def mirror_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("⏭ Skipped.")
 
 # ------------------------
-# Main
+# Main (check for wget instead of aria2c)
 # ------------------------
 def main():
-    # Check for aria2c availability
-    if not shutil.which("aria2c"):
-        logger.error("aria2c not found in PATH. Please install aria2.")
+    # Check for wget availability
+    if not shutil.which("wget"):
+        logger.error("wget not found in PATH. Please install wget.")
         return
 
     app = ApplicationBuilder().token(TOKEN).build()
@@ -372,7 +407,7 @@ def main():
         asyncio.create_task(worker(app))
 
     app.post_init = start_worker
-    logger.info("BOT STARTED")
+    logger.info("BOT STARTED (wget version)")
     app.run_polling()
 
 if __name__ == "__main__":

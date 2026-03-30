@@ -1,44 +1,42 @@
-name: Bot
+name: Transsion Downloader
 
 on:
   workflow_dispatch:
     inputs:
-      hours:
-        description: "Bot Alive (Default 2 Hours)"
+      url:
+        description: "Download URL"
         required: true
-        default: "2"
+      password:
+        description: "Password"
+        required: true
 
 jobs:
-  run-bot:
+  download:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout Repository
+      - name: 📥 Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: 🐍 Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-      
-      - name: Install aria2
-        run: |
-          sudo apt update && sudo apt install aria2 -y
+          python-version: "3.11"
 
-      - name: Install Dependencies
+      - name: 📦 Install dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y aria2
-          python -m pip install --upgrade pip
           pip install -r requirements.txt
+          playwright install
 
-      - name: Start Telegram Bot
+      - name: 🚀 Run downloader
         env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          PIXEL_TOKEN: ${{ secrets.PIXEL_TOKEN }}
-        run: |
-          HOURS=${{ github.event.inputs.hours }}
+          URL: ${{ github.event.inputs.url }}
+          PASSWORD: ${{ github.event.inputs.password }}
+        run: python transsion.py
 
-          timeout ${HOURS}h python bot.py
-
-          echo "Bot session timeout"
+      - name: 📤 Upload result link
+        uses: actions/upload-artifact@v4
+        with:
+         name: pixeldrain-link
+         path: result.txt
+     

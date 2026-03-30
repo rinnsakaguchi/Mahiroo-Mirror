@@ -10,12 +10,9 @@ import re
 from urllib.parse import urlparse, unquote
 from bs4 import BeautifulSoup
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
 
-# ------------------------
-# Globals
-# ------------------------
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 task_queue = asyncio.Queue()
 current_task = None
@@ -24,182 +21,233 @@ current_process = None
 current_chat = None
 cancel_requested = False
 url_cache = {}
-CACHE_EXPIRY = 300
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ------------------------
-# Utils
-# ------------------------
 def get_system_info():
-    total, used, free = shutil.disk_usage("/")
     ram = psutil.virtual_memory()
-    return f"CPU: {psutil.cpu_count()} | RAM: {ram.used//10**9}/{ram.total//10**9}GB | Disk: {free//10**9}GB free"
+    disk = shutil.disk_usage("/")
+    return f"CPU: {psutil.cpu_count()} | RAM: {ram.percent}% | Disk: {disk.free//10**9}GB"
 
 def get_filename(url):
     parsed = urlparse(url)
-    filename = unquote(os.path.basename(parsed.path))
-    if not filename or filename == "download":
+    filename = unquote(os.path.basename(parsed.path)).strip()
+    if not filename or filename in ['download', '', '/']:
         filename = f"file_{int(time.time())}"
     return filename
 
-def resolve_direct(url):
+def get_sf_mirrors(url):
     try:
-        r = requests.head(url, allow_redirects=True, timeout=10)
-        return r.url
+        r = requests.get(url, timeout=10)
+        soup = BeautifulSoup(r.text, "html.parser")
+        mirrors = [opt.get('value') for opt in soup.select("select#mirrorSelect option") if opt.get('value')]
+        logger.info(f"Found {len(mirrors)} SF mirrors")
+        return mirrors[:8]
     except:
-        return url
+        return []
 
 # ------------------------
-# Download (WGET)
+# DOWNLOAD
 # ------------------------
-async def download_file(msg, url, filename):
+async def download_file(application, chat_id, url, filename):
     global current_process
     
+    logger.info(f"Starting wget: {url[:100]}...")
+    
     cmd = [
-        "wget", "-q", "--show-progress", "--progress=bar:force",
-        "--tries=3", "--timeout=60", "-c",
-        "--user-agent=Mozilla/5.0", "--referer=https://frboxdata.transsion.com/",
+        "wget", "--no-verbose", "--show-progress", "--progress=bar:force:noscroll",
+        "--tries=3", "--timeout=60", "--limit-rate=10m", "-c",
+        "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "--referer=https://frboxdata.transsion.com/",
         "-O", filename, url
     ]
     
-    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
     current_process = process
 
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cancel")]])
-
-    while process.poll() is None:
-        line = process.stdout.readline()
-        if '%' in line:
-            try:
-                await msg.edit_text(f"📥 `{filename}`\n\n`{line.strip()}`", 
-                                  parse_mode='Markdown', reply_markup=kb)
-            except:
-                pass
-
-    current_process = None
-    if process.returncode != 0 or not os.path.exists(filename):
-        raise Exception("Download failed")
+    msg = await application.bot.send_message(chat_id, f"📥 `{filename}`", parse_mode='Markdown')
     
-    size = os.path.getsize(filename) / 10**9
-    await msg.edit_text(f"✅ `{filename}`\n📦 {size:.1f} GB", parse_mode='Markdown')
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cancel")]])
+    
+    try:
+        while process.poll() is None:
+            line = process.stdout.readline()
+            if '%' in line and 'B/s' in line:
+                try:
+                    await msg.edit_text(f"📥 `{filename}`\n\n`{line.strip()}`", 
+                                      parse_mode='Markdown', reply_markup=kb)
+                except:
+                    pass
+        await process.wait()
+    finally:
+        current_process = None
+
+    if not os.path.exists(filename) or os.path.getsize(filename) == 0:
+        raise Exception("Download failed - empty file")
+    
+    size_gb = os.path.getsize(filename) / (1024**3)
+    await msg.edit_text(f"✅ `{filename}`\n📦 **{size_gb:.2f} GB**", parse_mode='Markdown')
 
 # ------------------------
-# Worker
+# WORKER - FIXED
 # ------------------------
-async def worker(app):
-    global current_task, current_file, current_chat, cancel_requested
+async def worker(application):
+    logger.info("🟢 Worker started!")
     while True:
-        task = await task_queue.get()
-        chat_id = task["chat"]
-        url = task["url"]
-        
-        filename = get_filename(url)
-        current_file = filename
-        current_chat = chat_id
-        cancel_requested = False
-        
         try:
-            msg = await app.bot.send_message(chat_id, f"🚀 `{filename}`", parse_mode='Markdown')
-            await download_file(msg, resolve_direct(url), filename)
+            logger.info("Worker waiting for task...")
+            task = await task_queue.get()
+            logger.info(f"Got task: {task}")
             
-            if cancel_requested: 
-                await msg.edit_text("❌ Cancelled")
-                continue
+            chat_id = task["chat"]
+            url = task["url"]
+            filename = get_filename(url)
             
-            # Upload
-            await msg.edit_text("📤 Uploading...")
-            import concurrent.futures
-            loop = asyncio.get_event_loop()
+            await application.bot.send_message(chat_id, f"🚀 **{filename}**", parse_mode='Markdown')
             
-            def upload():
-                try:
-                    with open(filename, 'rb') as f:
-                        r = requests.post("https://store1.gofile.io/uploadFile", files={'file': f})
-                    return r.json()['data']['downloadPage']
-                except:
-                    return None
-            
-            link = await loop.run_in_executor(None, upload)
-            
-            if link:
-                await msg.edit_text(f"✅ `{link}`")
-            else:
-                await msg.edit_text("❌ Upload failed")
+            try:
+                await download_file(application, chat_id, url, filename)
                 
-        except Exception as e:
-            await app.bot.send_message(chat_id, f"❌ {e}")
-        
-        finally:
+                # Upload to GoFile
+                await application.bot.send_message(chat_id, "📤 Uploading...")
+                
+                def upload_file():
+                    try:
+                        with open(filename, 'rb') as f:
+                            r = requests.post("https://store1.gofile.io/uploadFile", 
+                                            files={'file': f}, timeout=300)
+                        data = r.json()
+                        return data['data']['downloadPage'] if 'data' in data else None
+                    except Exception as e:
+                        logger.error(f"Upload error: {e}")
+                        return None
+                
+                loop = asyncio.get_event_loop()
+                link = await loop.run_in_executor(None, upload_file)
+                
+                if link:
+                    await application.bot.send_message(chat_id, f"✅ **{link}**", parse_mode='Markdown')
+                else:
+                    await application.bot.send_message(chat_id, "❌ Upload failed")
+                    
+            except Exception as e:
+                logger.error(f"Task error: {e}")
+                await application.bot.send_message(chat_id, f"❌ **{str(e)}**", parse_mode='Markdown')
+            
+            # Cleanup
             if os.path.exists(filename):
                 os.remove(filename)
-            current_task = None
-            current_file = None
-            current_chat = None
+                
+        except Exception as e:
+            logger.error(f"Worker crashed: {e}")
+            await asyncio.sleep(5)
 
 # ------------------------
-# Handlers
+# COMMANDS
 # ------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        f"🤖 **Mahiro Bot** (wget)\n\n{get_system_info()}\n\n"
-        f"`/mirror <url>` or reply to link",
+        f"🤖 **Mahiro Mirror Bot**\n\n"
+        f"{get_system_info()}\n\n"
+        f"💡 `/mirror <url>`\n"
+        f"💡 Reply ke link\n"
+        f"📊 `/status`",
         parse_mode='Markdown'
     )
 
 async def mirror(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    url = context.args[0] if context.args else None
-    if not url and update.message.reply_to_message:
+    # Get URL from args or reply
+    url = None
+    if context.args:
+        url = context.args[0]
+    elif update.message.reply_to_message and update.message.reply_to_message.text:
         url = update.message.reply_to_message.text
     
     if not url:
-        await update.message.reply_text("❌ Send `/mirror <url>`")
+        await update.message.reply_text("❌ **Kirim URL!**\n`/mirror <link>`", parse_mode='Markdown')
         return
     
+    # SourceForge detection
+    if "sourceforge.net/projects" in url:
+        mirrors = get_sf_mirrors(url)
+        if mirrors:
+            kb = [[InlineKeyboardButton(m[:20], callback_data=f"sf:{m}")] for m in mirrors]
+            await update.message.reply_text(
+                "🌐 **Pilih Mirror SF:**",
+                reply_markup=InlineKeyboardMarkup(kb),
+                parse_mode='Markdown'
+            )
+            return
+    
+    # Add to queue
     await task_queue.put({"chat": update.effective_chat.id, "url": url})
-    await update.message.reply_text("🚀 Started!")
+    await update.message.reply_text("🚀 **Ditambahkan ke queue!**", parse_mode='Markdown')
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    status = f"Task: {current_task or 'Idle'}\nFile: `{current_file or 'None'}`\nQueue: {task_queue.qsize()}"
+    qsize = task_queue.qsize()
+    status = f"📊 **Status:**\nQueue: `{qsize}`\nTask: `{current_file or 'None'}`\n{ get_system_info() }"
     await update.message.reply_text(status, parse_mode='Markdown')
 
-async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global current_process, cancel_requested
-    q = update.callback_query
-    await q.answer()
+# ------------------------
+# BUTTONS & MESSAGES
+# ------------------------
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
     
-    if q.data == "cancel":
-        if current_process:
-            current_process.terminate()
-        cancel_requested = True
-        await q.edit_message_text("❌ Cancelled")
+    if query.data == "cancel" and current_process:
+        current_process.terminate()
+        await query.edit_message_text("❌ **Dibatalkan!**")
+    
+    elif query.data.startswith("sf:"):
+        mirror = query.data[3:]
+        await task_queue.put({
+            "chat": query.message.chat_id, 
+            "url": query.message.text + f"?use_mirror={mirror}"
+        })
+        await query.edit_message_text("🌐 **Mirror dipilih!** 🚀")
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Auto-detect URLs in messages"""
+    text = update.message.text
+    urls = re.findall(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\$\\$,]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', text)
+    
+    if urls:
+        await mirror(update, context)
 
 # ------------------------
-# MAIN - BULLETPROOF
+# MAIN - PERFECT
 # ------------------------
 def main():
+    print("🤖 Starting Mahiro Bot...")
+    
     if not TOKEN:
-        print("❌ Set TELEGRAM_TOKEN")
+        print("❌ TELEGRAM_TOKEN required!")
         return
+        
     if not shutil.which("wget"):
-        print("❌ Install wget")
+        print("❌ wget required!")
         return
 
     app = ApplicationBuilder().token(TOKEN).build()
     
+    # Handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("mirror", mirror))
     app.add_handler(CommandHandler("status", status))
-    app.add_handler(CallbackQueryHandler(button, pattern="^cancel$"))
+    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    # ✅ CORRECT WORKER START
-    async def post_init(application):
-        await worker(application)
+    # Start worker ✅
+    async def init_app(app):
+        logger.info("🔥 Starting worker...")
+        asyncio.create_task(worker(app))
+        logger.info("✅ Worker ready!")
     
-    app.post_init = post_init
+    app.post_init = init_app
     
-    print("🤖 Mahiro Bot Started! ✅")
+    print("🚀 Bot fully started!")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":

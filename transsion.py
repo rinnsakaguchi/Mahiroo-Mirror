@@ -2,9 +2,28 @@ import asyncio
 from playwright.async_api import async_playwright
 import subprocess
 import os
+import requests
 
 URL = os.getenv("URL")
 PASSWORD = os.getenv("PASSWORD")
+
+def upload_pixeldrain(file_path):
+    print("☁️ Uploading to PixelDrain...")
+
+    with open(file_path, "rb") as f:
+        r = requests.post(
+            "https://pixeldrain.com/api/file",
+            files={"file": f}
+        )
+
+    if r.status_code != 200:
+        print("❌ Upload failed:", r.text)
+        return None
+
+    data = r.json()
+    link = f"https://pixeldrain.com/u/{data['id']}"
+    return link
+
 
 async def main():
     async with async_playwright() as p:
@@ -58,7 +77,21 @@ async def main():
             print("❌ Download failed")
             exit(1)
 
-        print("✅ Done!")
+        print("✅ Download done!")
+
+        # upload ke pixeldrain
+        link = upload_pixeldrain(filename)
+
+        if not link:
+            print("❌ Upload failed")
+            exit(1)
+
+        print("✅ PixelDrain Link:", link)
+
+        # simpan ke file biar muncul di artifact/log
+        with open("result.txt", "w") as f:
+            f.write(link)
+
         await browser.close()
 
 asyncio.run(main())

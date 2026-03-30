@@ -21,15 +21,13 @@ TOKEN = os.getenv("TELEGRAM_TOKEN")
 task_queue = asyncio.Queue()
 current_task = None
 current_file = None
-current_process = None          # for cancellation
-current_chat = None              # chat id of current download
-cancel_requested = False         # flag for upload cancellation
+current_process = None
+current_chat = None
+cancel_requested = False
 
-# Simple URL cache for callback data
 url_cache = {}
-CACHE_EXPIRY = 300  # seconds
+CACHE_EXPIRY = 300
 
-# Logging
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
@@ -49,28 +47,44 @@ def get_system_info():
     }
 
 # ------------------------
-# Resolve direct link
+# URL Helpers
 # ------------------------
 def resolve_direct(url):
     try:
-        r = requests.head(url, allow_redirects=True, timeout=10)
+        r = requests.head(url, allow_redirects=True, timeout=15)
         return r.url
     except:
         return url
 
+def fix_oss_url(url):
+    """Fix Transsion/OSS URLs"""
+    if "frboxdata.transsion.com" in url:
+        return url
+    if "oss" in url.lower() or "aliyuncs" in url:
+        return url
+    return url
+
+def get_filename(url):
+    parsed = urlparse(url)
+    filename = unquote(os.path.basename(parsed.path))
+    if not filename or filename == "download":
+        parts = parsed.path.split("/")
+        filename = parts[-2] if len(parts) > 2 else f"file_{int(time.time())}"
+    return filename
+
 # ------------------------
-# SourceForge mirror detection
+# SourceForge
 # ------------------------
 def get_sf_mirrors(url):
     try:
-        page = requests.get(url, timeout=10)
+        page = requests.get(url, timeout=15)
         soup = BeautifulSoup(page.text, "html.parser")
         mirrors = []
         for option in soup.select("select#mirrorSelect option"):
             mirror_name = option.get("value")
             if mirror_name:
                 mirrors.append(mirror_name)
-        return mirrors
+        return mirrors[:10]  # Limit to 10 fastest
     except:
         return []
 
@@ -80,32 +94,40 @@ def build_sf_mirror(url, mirror):
     return url
 
 # ------------------------
-# GoFile uploader (unchanged)
+# GoFile Upload
 # ------------------------
-def upload_gofile(file):
-    with open(file, "rb") as f:
-        r = requests.post("https://store1.gofile.io/uploadFile", files={"file": f})
+def upload_gofile(file_path):
     try:
+        with open(file_path, "rb") as f:
+            r = requests.post("https://store1.gofile.io/uploadFile", files={"file": f}, timeout=300)
         return r.json()["data"]["downloadPage"]
     except:
         return None
 
 # ------------------------
-# Download using wget (REPLACED aria2c)
+# WGET Download (FINAL VERSION)
 # ------------------------
 async def download_file(msg, url, filename):
     global current_process
     
-    # wget command with resume support, progress, and speed limit
+    # Ultimate wget command
     cmd = [
         "wget",
-        "--progress=bar:force:noscroll",  # Progress bar
-        "--tries=0",                      # Infinite retries
-        "--timeout=30",                   # Timeout
-        "--limit-rate=10m",               # Speed limit 10MB/s
-        "-c",                             # Continue partial download
-        "--user-agent=Mozilla/5.0",       # User agent
-        "-O", filename,                   # Output filename
+        "-v",                                    # Verbose
+        "--progress=bar:force:noscroll",         # Sexy progress bar
+        "--tries=5",                             # Retry 5x
+        "--timeout=90",                          # 90s timeout
+        "--limit-rate=15m",                      # 15MB/s max
+        "-c",                                    # Continue/Resume
+        "--no-check-certificate",                # Skip SSL
+        "--no-cache",                            # No cache
+        "--header", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "--header", "Accept: */*",
+        "--header", "Accept-Language: en-US,en;q=0.9",
+        "--header", "Accept-Encoding: gzip, deflate, br",
+        "--header", "Connection: keep-alive",
+        "--header", "Referer: https://frboxdata.transsion.com/",
+        "-O", filename,
         url
     ]
     
@@ -114,122 +136,167 @@ async def download_file(msg, url, filename):
         stdout=subprocess.PIPE, 
         stderr=subprocess.STDOUT, 
         text=True,
-        bufsize=1,  # Line buffered
+        bufsize=1,
         universal_newlines=True
     )
     current_process = process
 
-    # Cancel button for download phase
     cancel_keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("❌ Cancel Download", callback_data="cancel_download")
     ]])
 
     last_update = time.time()
     last_progress = ""
+    error_detected = False
     
-    while True:
-        line = process.stdout.readline()
-        if not line and process.poll() is not None:
-            break
+    while process.poll() is None:
+        line = process.stdout.readline().strip()
+        if not line:
+            continue
             
-        # Parse wget progress
-        if '%' in line and 'MB' in line:
-            # Extract percentage and speed
+        logger.info(f"WGET: {line}")
+        
+        # Error detection
+        error_keywords = ['error', 'failed', '403 forbidden', '404 not found', '401 unauthorized']
+        if any(keyword in line.lower() for keyword in error_keywords):
+            error_detected = True
+            logger.error(f"Error detected: {line}")
+        
+        # Progress parsing (enhanced)
+        if '%' in line and ('[' in line or 'MB' in line):
             percent_match = re.search(r'(\d+(?:\.\d+)?)%', line)
             speed_match = re.search(r'([0-9.]+[KMG]?B/s)', line)
+            size_match = re.search(r'([0-9.]+[KMG]?B)', line)
             
             if percent_match:
                 progress = f"[{percent_match.group(1)}%] "
                 if speed_match:
-                    progress += speed_match.group(1)
+                    progress += f"⚡ {speed_match.group(1)} "
+                if size_match:
+                    progress += size_match.group(1)
+                
                 if progress != last_progress and time.time() - last_update > 1.5:
                     last_progress = progress
                     last_update = time.time()
                     try:
                         await msg.edit_text(
-                            f"📥 Downloading\n`{filename}`\n\n"
-                            f"{progress}\n"
-                            f"`{line.strip()}`",
+                            f"📥 Downloading...\n"
+                            f"`{filename}`\n\n"
+                            f"{progress}",
                             parse_mode="Markdown",
                             reply_markup=cancel_keyboard
                         )
-                    except:
-                        pass
+                    except Exception as e:
+                        logger.error(f"Edit message failed: {e}")
 
-    # Wait for process to complete
     code = process.wait()
     current_process = None
     
-    if code != 0 or not os.path.exists(filename) or os.path.getsize(filename) == 0:
-        raise Exception("Download failed or file is empty")
+    # Comprehensive file validation
+    if not os.path.exists(filename):
+        raise Exception("File not created")
     
-    file_size = os.path.getsize(filename) / (1024**3)  # GB
+    file_size = os.path.getsize(filename)
+    if file_size == 0:
+        raise Exception("File is empty (0 bytes)")
+    
+    if file_size < 512:  # Less than 512 bytes
+        raise Exception(f"File too small: {file_size} bytes")
+    
+    file_size_gb = file_size / (1024**3)
+    file_size_mb = file_size / (1024**2)
+    
     await msg.edit_text(
-        f"✅ Download Complete\n"
+        f"✅ Download Complete!\n"
         f"`{filename}`\n"
-        f"📦 Size: {file_size:.2f} GB",
+        f"📦 {file_size_gb:.2f} GB ({file_size_mb:.1f} MB)",
         parse_mode="Markdown"
     )
+    
+    return filename
 
 # ------------------------
-# Worker (minor changes for wget)
+# Worker (FINAL)
 # ------------------------
 async def worker(app):
     global current_task, current_file, current_process, current_chat, cancel_requested
     while True:
         task = await task_queue.get()
-        chat = task["chat"]
+        chat_id = task["chat"]
         url = task["url"]
         mirror = task.get("mirror")
 
-        parsed = urlparse(url)
-        filename = unquote(os.path.basename(parsed.path))
-        if not filename or filename == "download":
-            parts = parsed.path.split("/")
-            filename = parts[-2] if len(parts) > 2 else f"file_{int(time.time())}"
-
+        filename = get_filename(url)
         current_file = filename
         current_task = "Downloading"
-        current_chat = chat
+        current_chat = chat_id
         cancel_requested = False
-        msg = await app.bot.send_message(chat, f"📥 Starting download\n`{filename}`", parse_mode="Markdown")
+        
+        msg = await app.bot.send_message(
+            chat_id, 
+            f"🚀 Starting mirror...\n`{filename}`", 
+            parse_mode="Markdown"
+        )
 
         try:
+            # Process URL
             if mirror:
-                url = build_sf_mirror(url, mirror)
+                final_url = build_sf_mirror(url, mirror)
             else:
-                url = resolve_direct(url)
-            await download_file(msg, url, filename)
+                final_url = fix_oss_url(resolve_direct(url))
+            
+            logger.info(f"Downloading: {final_url}")
+            
+            # Download
+            await download_file(msg, final_url, filename)
 
-            # If download was cancelled, skip upload
             if cancel_requested:
-                await msg.edit_text("❌ Operation cancelled.")
+                await msg.edit_text("❌ Operation cancelled by user.")
                 continue
 
+            # Upload
             current_task = "Uploading"
-            # Upload phase with cancel button
             upload_keyboard = InlineKeyboardMarkup([[
                 InlineKeyboardButton("❌ Cancel Upload", callback_data="cancel_upload")
             ]])
-            await msg.edit_text("📤 Uploading... (click Cancel to discard)", reply_markup=upload_keyboard)
+            
+            await msg.edit_text(
+                "📤 Uploading to GoFile...\n"
+                f"`{filename}`\n"
+                "(Click Cancel to discard file)", 
+                parse_mode="Markdown",
+                reply_markup=upload_keyboard
+            )
 
-            # Run upload in a thread to keep bot responsive
             loop = asyncio.get_event_loop()
             link = await loop.run_in_executor(None, upload_gofile, filename)
 
             if cancel_requested:
-                await msg.edit_text("❌ Upload cancelled by user.")
+                await msg.edit_text("❌ Upload cancelled.")
             elif link:
-                await msg.edit_text(f"✅ Mirror Complete\n{link}")
+                await msg.edit_text(
+                    f"✅ **Mirror Complete!**\n\n"
+                    f"🔗 `{link}`\n\n"
+                    f"💾 `{filename}`",
+                    parse_mode="Markdown"
+                )
             else:
-                await msg.edit_text("❌ Upload failed")
+                await msg.edit_text("❌ GoFile upload failed. File discarded.")
 
+        except subprocess.TimeoutExpired:
+            await msg.edit_text("⏰ Download timeout.")
         except Exception as e:
-            await msg.edit_text(f"❌ Error\n`{str(e)}`", parse_mode="Markdown")
+            error_msg = f"❌ Error\n`{str(e)}`"
+            await msg.edit_text(error_msg, parse_mode="Markdown")
+            logger.error(f"Download error: {e}")
 
         finally:
+            # Cleanup
             if os.path.exists(filename):
-                os.remove(filename)
+                try:
+                    os.remove(filename)
+                except:
+                    pass
             current_task = None
             current_file = None
             current_process = None
@@ -237,178 +304,159 @@ async def worker(app):
             cancel_requested = False
 
 # ------------------------
-# Commands (unchanged)
+# Commands
 # ------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sys = get_system_info()
     await update.message.reply_text(
-        f"🤖 Mahiro Mirror Bot Ready (wget version)\n\n"
-        f"CPU : {sys['cpu']}\n"
-        f"RAM : {sys['ram']}\n"
-        f"Disk : {sys['disk']}\n\n"
-        "/mirror <link>\n"
-        "/status"
+        f"🤖 **Mahiro Mirror Bot** (wget v2.0)\n\n"
+        f"💻 CPU: {sys['cpu']} cores\n"
+        f"🧠 RAM: {sys['ram']}\n"
+        f"💾 Disk: {sys['disk']}\n\n"
+        f"📋 **Commands:**\n"
+        f"`/mirror <link>` - Start mirroring\n"
+        f"`/status` - Bot status\n"
+        f"`Reply link` - Quick mirror",
+        parse_mode="Markdown"
     )
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sys = get_system_info()
     queue_size = task_queue.qsize()
-    task = f"{current_task}\n{current_file}" if current_task else "Idle"
+    task_status = f"{current_task}\n`{current_file}`" if current_task else "🟢 Idle"
+    
     await update.message.reply_text(
-        f"📊 Bot Status\n\n"
-        f"CPU : {sys['cpu']}\n"
-        f"RAM : {sys['ram']}\n"
-        f"Disk : {sys['disk']}\n\n"
-        f"Task : {task}\n"
-        f"Queue : {queue_size}"
+        f"📊 **Bot Status**\n\n"
+        f"💻 CPU: {sys['cpu']} cores\n"
+        f"🧠 RAM: {sys['ram']}\n"
+        f"💾 Disk: {sys['disk']}\n\n"
+        f"📂 Current: {task_status}\n"
+        f"📋 Queue: {queue_size}",
+        parse_mode="Markdown"
     )
 
 async def mirror(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.args:
         url = context.args[0]
-    elif update.message.reply_to_message:
+    elif update.message.reply_to_message and update.message.reply_to_message.text:
         url = update.message.reply_to_message.text
     else:
-        await update.message.reply_text("Usage:\n/mirror <link>")
+        await update.message.reply_text("❌ **Usage:**\n`/mirror <link>`\n**or** reply to link", parse_mode="Markdown")
         return
 
-    # Generate a unique cache ID and store URL
-    cache_id = str(int(time.time()))
+    cache_id = str(int(time.time() * 1000))
     url_cache[cache_id] = (url, time.time())
 
-    # Clean expired cache entries occasionally
+    # Cleanup expired cache
     now = time.time()
     expired = [cid for cid, (_, ts) in url_cache.items() if now - ts > CACHE_EXPIRY]
     for cid in expired:
         del url_cache[cid]
 
+    # SourceForge auto-detection
     if "sourceforge.net/projects" in url:
         mirrors = get_sf_mirrors(url)
-        if not mirrors:
-            await task_queue.put({"chat": update.effective_chat.id, "url": url})
-            return
-        if len(mirrors) == 1:
-            await task_queue.put({"chat": update.effective_chat.id, "url": url, "mirror": mirrors[0]})
-            await update.message.reply_text(f"🌐 Mirror auto selected: {mirrors[0]}")
-            return
-
-        # Multiple mirrors → show buttons
-        buttons = []
-        row = []
-        for i, m in enumerate(mirrors, 1):
-            row.append(InlineKeyboardButton(m, callback_data=f"sf|{cache_id}|{m}"))
-            if i % 5 == 0:
+        if mirrors:
+            if len(mirrors) == 1:
+                await task_queue.put({"chat": update.effective_chat.id, "url": url, "mirror": mirrors[0]})
+                await update.message.reply_text(f"🌐 Auto-selected: `{mirrors[0]}`", parse_mode="Markdown")
+                return
+            
+            # Mirror selection buttons
+            buttons = []
+            for i, m in enumerate(mirrors[:10]):
+                row = [InlineKeyboardButton(m[:20], callback_data=f"sf|{cache_id}|{m}")]
                 buttons.append(row)
-                row = []
-        if row:
-            buttons.append(row)
+            
+            await update.message.reply_text(
+                "🌐 **Choose SourceForge Mirror:**",
+                reply_markup=InlineKeyboardMarkup(buttons),
+                parse_mode="Markdown"
+            )
+            return
 
-        await update.message.reply_text(
-            "🌐 Choose SourceForge mirror",
-            reply_markup=InlineKeyboardMarkup(buttons)
-        )
-        return
-    else:
-        # Direct link or others
-        buttons = [[
-            InlineKeyboardButton("🌐 Mirror", callback_data=f"link|{cache_id}"),
-            InlineKeyboardButton("⏭ Skip", callback_data="skip"),
-            InlineKeyboardButton("❌ Cancel", callback_data=f"cancel|{cache_id}")
-        ]]
-        await update.message.reply_text(
-            "👋 *Hi! I'm Mahiro BOT*\nI detected a file link, choose an option below.",
-            reply_markup=InlineKeyboardMarkup(buttons),
-            parse_mode="Markdown"
-        )
+    # Default mirror button
+    buttons = [[
+        InlineKeyboardButton("🚀 Start Mirror", callback_data=f"link|{cache_id}"),
+        InlineKeyboardButton("⏭ Skip", callback_data="skip")
+    ]]
+    
+    await update.message.reply_text(
+        f"🔗 **Detected:** `{url[:50]}...`\n\n"
+        f"👇 Choose action:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode="Markdown"
+    )
 
 # ------------------------
-# Callback query handler (unchanged)
+# Callback Handler
 # ------------------------
 async def mirror_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global current_process, current_task, current_file, current_chat, cancel_requested
+    global current_process, current_chat
     query = update.callback_query
     await query.answer()
     data = query.data
 
     if data.startswith("sf|"):
-        _, cache_id, mirror = data.split("|")
+        _, cache_id, mirror = data.split("|", 2)
         url_info = url_cache.get(cache_id)
-        if not url_info:
-            await query.edit_message_text("⏰ This link has expired. Please send again.")
-            return
-        url, _ = url_info
-        await query.message.edit_text(f"🌐 Mirror selected: {mirror}")
-        await task_queue.put({"chat": query.message.chat_id, "url": url, "mirror": mirror})
+        if url_info:
+            url, _ = url_info
+            await query.message.edit_text(f"🌐 **Mirror:** `{mirror}`\n🚀 Starting...", parse_mode="Markdown")
+            await task_queue.put({"chat": query.message.chat_id, "url": url, "mirror": mirror})
         del url_cache[cache_id]
 
     elif data.startswith("link|"):
         _, cache_id = data.split("|")
         url_info = url_cache.get(cache_id)
-        if not url_info:
-            await query.edit_message_text("⏰ This link has expired. Please send again.")
-            return
-        url, _ = url_info
-        await query.message.edit_text("🌐 Starting mirror...")
-        await task_queue.put({"chat": query.message.chat_id, "url": url})
+        if url_info:
+            url, _ = url_info
+            await query.message.edit_text("🚀 **Mirroring started...**")
+            await task_queue.put({"chat": query.message.chat_id, "url": url})
         del url_cache[cache_id]
 
     elif data == "cancel_download":
-        chat_id = query.message.chat_id
-        if current_chat == chat_id and current_process:
+        if current_chat == query.message.chat_id and current_process:
             current_process.terminate()
-            current_process = None
-            current_task = None
-            current_file = None
-            current_chat = None
-            await query.edit_message_text("❌ Download cancelled.")
+            await query.edit_message_text("❌ **Download cancelled.**")
         else:
-            await query.edit_message_text("No active download to cancel.")
+            await query.answer("No active download.")
 
     elif data == "cancel_upload":
-        chat_id = query.message.chat_id
-        if current_chat == chat_id:
+        if current_chat == query.message.chat_id:
             cancel_requested = True
-            await query.edit_message_text("❌ Upload will be cancelled after current transfer.")
+            await query.edit_message_text("❌ **Upload cancelled.**")
         else:
-            await query.edit_message_text("No active upload to cancel.")
-
-    elif data.startswith("cancel|"):
-        _, cache_id = data.split("|")
-        chat_id = query.message.chat_id
-        if current_chat == chat_id and current_process:
-            current_process.terminate()
-            current_process = None
-            current_task = None
-            current_file = None
-            current_chat = None
-            await query.edit_message_text("❌ Current download cancelled.")
-        else:
-            await query.edit_message_text("No active download from this chat to cancel.")
+            await query.answer("No active upload.")
 
     elif data == "skip":
-        await query.edit_message_text("⏭ Skipped.")
+        await query.edit_message_text("⏭ **Skipped.**")
 
 # ------------------------
-# Main (check for wget instead of aria2c)
+# MAIN
 # ------------------------
 def main():
-    # Check for wget availability
     if not shutil.which("wget"):
-        logger.error("wget not found in PATH. Please install wget.")
+        logger.error("❌ wget not found! Install: sudo apt install wget")
         return
 
     app = ApplicationBuilder().token(TOKEN).build()
+    
+    # Handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler(["mirror", "m"], mirror))
-    app.add_handler(CallbackQueryHandler(mirror_select, pattern="^(sf\||link\||cancel_download|cancel_upload|cancel|skip)"))
+    app.add_handler(CallbackQueryHandler(mirror_select))
 
+    # Start worker
     async def start_worker(app):
-        asyncio.create_task(worker(app))
+        await worker(app)
 
-    app.post_init = start_worker
-    logger.info("BOT STARTED (wget version)")
-    app.run_polling()
+    app.post_init = lambda app: asyncio.create_task(start_worker(app))
+    
+    logger.info("🎉 Mahiro Mirror Bot (wget) STARTED!")
+    print("🤖 Bot running... Press Ctrl+C to stop")
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
